@@ -33,6 +33,15 @@
   }
 )
 
+;; Bridge Registry - stores information about bridge contracts
+(define-map bridge-registry
+  { bridge-source-chain: uint, bridge-target-chain: uint }
+  {
+    bridge-contract: principal,
+    bridge-status: (string-ascii 16)  ;; "active", "paused", "deprecated"
+  }
+)
+
 ;; Access control - check if sender is contract owner
 (define-private (is-contract-owner)
   (is-eq tx-sender CONTRACT-OWNER)
@@ -114,6 +123,49 @@
   )
 )
 
+;; Bridge management functions
+;; Register a new bridge between chains
+(define-public (register-bridge 
+  (source-registry-chain-id uint) 
+  (target-registry-chain-id uint) 
+  (bridge-contract principal)
+)
+  (begin
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? chain-registry { registry-chain-id: source-registry-chain-id })) ERR-INVALID-CHAIN)
+    (asserts! (is-some (map-get? chain-registry { registry-chain-id: target-registry-chain-id })) ERR-INVALID-CHAIN)
+    (asserts! (is-none (map-get? bridge-registry { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id })) ERR-ALREADY-REGISTERED)
+    
+    (map-set bridge-registry
+      { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id }
+      {
+        bridge-contract: bridge-contract,
+        bridge-status: "active"
+      }
+    )
+    (ok bridge-contract)
+  )
+)
+
+;; Update bridge status
+(define-public (update-bridge-status 
+  (source-registry-chain-id uint) 
+  (target-registry-chain-id uint) 
+  (new-status (string-ascii 16))
+)
+  (let (
+    (bridge-info (unwrap! (map-get? bridge-registry { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id }) ERR-NOT-REGISTERED))
+  )
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    
+    (map-set bridge-registry
+      { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id }
+      (merge bridge-info { bridge-status: new-status })
+    )
+    (ok true)
+  )
+)
+
 ;; Read-only functions
 ;; Get chain information
 (define-read-only (get-chain-info (registry-chain-id uint))
@@ -125,10 +177,23 @@
   (map-get? adapter-registry { adapter-principal: adapter-id })
 )
 
+;; Get bridge information
+(define-read-only (get-bridge-info (source-registry-chain-id uint) (target-registry-chain-id uint))
+  (map-get? bridge-registry { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id })
+)
+
 ;; Check if a chain is active
 (define-read-only (is-chain-active (registry-chain-id uint))
   (match (map-get? chain-registry { registry-chain-id: registry-chain-id })
     chain-info (is-eq (get chain-status chain-info) "active")
+    false
+  )
+)
+
+;; Check if a bridge is active
+(define-read-only (is-bridge-active (source-registry-chain-id uint) (target-registry-chain-id uint))
+  (match (map-get? bridge-registry { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id })
+    bridge-info (is-eq (get bridge-status bridge-info) "active")
     false
   )
 )
