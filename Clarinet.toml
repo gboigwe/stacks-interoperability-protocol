@@ -5,6 +5,11 @@ authors = []
 telemetry = true
 cache_dir = './.cache'
 requirements = []
+[contracts.message-relay]
+path = 'contracts/message-relay.clar'
+clarity_version = 2
+epoch = 2.5
+
 [contracts.sip-registry]
 path = 'contracts/sip-registry.clar'
 clarity_version = 2
