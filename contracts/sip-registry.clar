@@ -5,216 +5,294 @@
 
 ;; Error codes
 (define-constant ERR-NOT-AUTHORIZED (err u100))
-(define-constant ERR-INVALID-MESSAGE (err u101))
-(define-constant ERR-ALREADY-PROCESSED (err u102))
+(define-constant ERR-ALREADY-REGISTERED (err u101))
+(define-constant ERR-NOT-REGISTERED (err u102))
 (define-constant ERR-INVALID-CHAIN (err u103))
-(define-constant ERR-VERIFICATION-FAILED (err u104))
-(define-constant ERR-MESSAGE-EXPIRED (err u105))
 
 ;; Contract owner
 (define-constant CONTRACT-OWNER tx-sender)
 
-;; Registry contract
-(define-constant REGISTRY-CONTRACT 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.sip-registry)
-
-;; Message status constants
-(define-constant STATUS-PENDING "pending")
-(define-constant STATUS-EXECUTED "executed")
-(define-constant STATUS-FAILED "failed")
-
 ;; Data structures
-
-;; Message structure
-;; A cross-chain message with all necessary metadata
-(define-map message-registry
-  { message-id: (buff 32) }
+;; Chain Registry - stores information about supported chains
+(define-map chain-registry
+  { registry-chain-id: uint }
   {
-    message-source-chain: uint,
-    message-dest-chain: uint,
-    message-nonce: uint,
-    message-sender: principal,
-    message-recipient: (buff 32),
-    message-payload: (buff 1024),
-    message-timestamp: uint,
-    message-expiration: uint,
-    message-status: (string-ascii 16)
+    chain-name: (string-ascii 32),
+    chain-status: (string-ascii 16),  ;; "active", "paused", "deprecated"
+    chain-adapter: principal,
+    chain-last-block: uint,
+    chain-confirmations-required: uint
   }
 )
 
-;; Message nonce tracking to prevent replay attacks
-(define-map nonce-registry
-  { nonce-chain-id: uint }
-  { next-nonce: uint }
+;; Adapter Registry - stores information about chain adapters
+(define-map adapter-registry
+  { adapter-principal: principal }
+  {
+    adapter-chain-id: uint,
+    adapter-type: (string-ascii 16),  ;; "light-client", "oracle", "hybrid"
+    adapter-status: (string-ascii 16),  ;; "active", "paused", "deprecated"
+    adapter-version: (string-ascii 16)
+  }
 )
 
-;; Processed messages to prevent duplicates
-(define-map processed-registry
-  { processed-source-chain: uint, processed-nonce: uint }
-  { processed: bool }
+;; Bridge Registry - stores information about bridge contracts
+(define-map bridge-registry
+  { bridge-source-chain: uint, bridge-target-chain: uint }
+  {
+    bridge-source-adapter: principal,
+    bridge-target-adapter: principal,
+    bridge-contract: principal,
+    bridge-status: (string-ascii 16)  ;; "active", "paused", "deprecated"
+  }
 )
 
-;; Variables
-(define-data-var message-fee uint u1000) ;; Fee in microSTX for sending messages
-
-;; Functions
+;; Resource Registry - stores information about bridged resources (tokens, etc.)
+(define-map resource-registry
+  { resource-chain-id: uint, resource-hash: (buff 32) }
+  {
+    resource-type: (string-ascii 16),  ;; "ft", "nft", "data"
+    resource-contract: principal,
+    resource-name: (string-ascii 64),
+    resource-status: (string-ascii 16)  ;; "active", "paused", "deprecated"
+  }
+)
 
 ;; Access control - check if sender is contract owner
 (define-private (is-contract-owner)
   (is-eq tx-sender CONTRACT-OWNER)
 )
 
-;; Send a cross-chain message
-(define-public (send-message 
-  (dest-registry-chain-id uint) 
-  (recipient (buff 32)) 
-  (payload (buff 1024))
-  (expiration uint)
-)
-  (let (
-    (source-registry-chain-id u1)  ;; Stacks chain ID is 1 in this example
-    (nonce-data (default-to { next-nonce: u0 } (map-get? nonce-registry { nonce-chain-id: source-registry-chain-id })))
-    (next-nonce (get next-nonce nonce-data))
-    (curr-time block-height)
-    
-    ;; Create a simple message ID from recipient and payload
-    (message-id (sha256 (concat recipient payload)))
-  )
-    ;; Verify chain is supported
-    (asserts! (contract-call? REGISTRY-CONTRACT is-chain-active dest-registry-chain-id) ERR-INVALID-CHAIN)
-    
-    ;; Collect message fee
-    (try! (stx-transfer? (var-get message-fee) tx-sender CONTRACT-OWNER))
-    
-    ;; Store message
-    (map-set message-registry
-      { message-id: message-id }
-      {
-        message-source-chain: source-registry-chain-id,
-        message-dest-chain: dest-registry-chain-id,
-        message-nonce: next-nonce,
-        message-sender: tx-sender,
-        message-recipient: recipient,
-        message-payload: payload,
-        message-timestamp: curr-time,
-        message-expiration: expiration,
-        message-status: STATUS-PENDING
-      }
-    )
-    
-    ;; Update nonce
-    (map-set nonce-registry
-      { nonce-chain-id: source-registry-chain-id }
-      { next-nonce: (+ next-nonce u1) }
-    )
-    
-    ;; Emit event for relayers
-    (print {
-      event: "message-sent",
-      message-id: message-id,
-      source-chain: source-registry-chain-id,
-      dest-chain: dest-registry-chain-id,
-      nonce: next-nonce,
-      sender: tx-sender,
-      recipient: recipient
-    })
-    
-    (ok message-id)
-  )
-)
+;; Chain management functions
 
-;; Receive and process a message from another chain
-(define-public (receive-message
-  (source-registry-chain-id uint)
-  (nonce uint)
-  (sender principal)
-  (recipient (buff 32))
-  (payload (buff 1024))
-  (timestamp uint)
-  (expiration uint)
-  (message-id (buff 32))
+;; Register a new chain
+(define-public (register-chain 
+  (registry-chain-id uint) 
+  (chain-name (string-ascii 32)) 
+  (chain-adapter principal) 
+  (chain-confirmations uint)
 )
-  (let (
-    (dest-registry-chain-id u1)  ;; Stacks chain ID is 1
-    (curr-time block-height)
-  )
-    ;; Check if message already processed
-    (asserts! (is-none (map-get? processed-registry 
-      { processed-source-chain: source-registry-chain-id, processed-nonce: nonce })) 
-      ERR-ALREADY-PROCESSED)
-    
-    ;; Verify chain is supported
-    (asserts! (contract-call? REGISTRY-CONTRACT is-chain-active source-registry-chain-id) ERR-INVALID-CHAIN)
-    
-    ;; Check message hasn't expired
-    (asserts! (< curr-time expiration) ERR-MESSAGE-EXPIRED)
-    
-    ;; Mark message as processed
-    (map-set processed-registry
-      { processed-source-chain: source-registry-chain-id, processed-nonce: nonce }
-      { processed: true }
-    )
-    
-    ;; Store message
-    (map-set message-registry
-      { message-id: message-id }
-      {
-        message-source-chain: source-registry-chain-id,
-        message-dest-chain: dest-registry-chain-id,
-        message-nonce: nonce,
-        message-sender: sender,
-        message-recipient: recipient,
-        message-payload: payload,
-        message-timestamp: timestamp,
-        message-expiration: expiration,
-        message-status: STATUS-EXECUTED
-      }
-    )
-    
-    ;; Forward message to recipient contract
-    ;; In a real implementation, this would use a more sophisticated mechanism
-    ;; for handling different message types
-    (print {
-      event: "message-received",
-      message-id: message-id,
-      source-chain: source-registry-chain-id,
-      dest-chain: dest-registry-chain-id,
-      nonce: nonce,
-      sender: sender,
-      recipient: tx-sender
-    })
-    
-    (ok message-id)
-  )
-)
-
-;; Admin functions
-
-;; Update message fee
-(define-public (set-message-fee (new-fee uint))
   (begin
     (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
-    (var-set message-fee new-fee)
-    (ok new-fee)
+    (asserts! (is-none (map-get? chain-registry { registry-chain-id: registry-chain-id })) ERR-ALREADY-REGISTERED)
+    
+    (map-set chain-registry
+      { registry-chain-id: registry-chain-id }
+      {
+        chain-name: chain-name,
+        chain-status: "active",
+        chain-adapter: chain-adapter,
+        chain-last-block: u0,
+        chain-confirmations-required: chain-confirmations
+      }
+    )
+    (ok registry-chain-id)
+  )
+)
+
+;; Update chain status
+(define-public (update-chain-status (registry-chain-id uint) (new-status (string-ascii 16)))
+  (let (
+    (chain-info (unwrap! (map-get? chain-registry { registry-chain-id: registry-chain-id }) ERR-NOT-REGISTERED))
+  )
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    
+    (map-set chain-registry
+      { registry-chain-id: registry-chain-id }
+      (merge chain-info { chain-status: new-status })
+    )
+    (ok registry-chain-id)
+  )
+)
+
+;; Update last processed block for a chain
+(define-public (update-last-block (registry-chain-id uint) (new-block-height uint))
+  (let (
+    (chain-info (unwrap! (map-get? chain-registry { registry-chain-id: registry-chain-id }) ERR-NOT-REGISTERED))
+    (adapter (get chain-adapter chain-info))
+  )
+    ;; Only the registered adapter for this chain can update the last block
+    (asserts! (is-eq tx-sender adapter) ERR-NOT-AUTHORIZED)
+    
+    (map-set chain-registry
+      { registry-chain-id: registry-chain-id }
+      (merge chain-info { chain-last-block: new-block-height })
+    )
+    (ok new-block-height)
+  )
+)
+
+;; Adapter management functions
+
+;; Register a new adapter
+(define-public (register-adapter 
+  (adapter-id principal) 
+  (registry-chain-id uint) 
+  (adapter-type (string-ascii 16)) 
+  (adapter-version (string-ascii 16))
+)
+  (begin
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none (map-get? adapter-registry { adapter-principal: adapter-id })) ERR-ALREADY-REGISTERED)
+    (asserts! (is-some (map-get? chain-registry { registry-chain-id: registry-chain-id })) ERR-INVALID-CHAIN)
+    
+    (map-set adapter-registry
+      { adapter-principal: adapter-id }
+      {
+        adapter-chain-id: registry-chain-id,
+        adapter-type: adapter-type,
+        adapter-status: "active",
+        adapter-version: adapter-version
+      }
+    )
+    (ok adapter-id)
+  )
+)
+
+;; Update adapter status
+(define-public (update-adapter-status (adapter-id principal) (new-status (string-ascii 16)))
+  (let (
+    (adapter-info (unwrap! (map-get? adapter-registry { adapter-principal: adapter-id }) ERR-NOT-REGISTERED))
+  )
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    
+    (map-set adapter-registry
+      { adapter-principal: adapter-id }
+      (merge adapter-info { adapter-status: new-status })
+    )
+    (ok adapter-id)
+  )
+)
+
+;; Bridge management functions
+
+;; Register a new bridge between chains
+(define-public (register-bridge 
+  (source-registry-chain-id uint) 
+  (target-registry-chain-id uint) 
+  (source-adapter principal) 
+  (target-adapter principal) 
+  (bridge-contract principal)
+)
+  (begin
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? chain-registry { registry-chain-id: source-registry-chain-id })) ERR-INVALID-CHAIN)
+    (asserts! (is-some (map-get? chain-registry { registry-chain-id: target-registry-chain-id })) ERR-INVALID-CHAIN)
+    (asserts! (is-none (map-get? bridge-registry { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id })) ERR-ALREADY-REGISTERED)
+    
+    (map-set bridge-registry
+      { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id }
+      {
+        bridge-source-adapter: source-adapter,
+        bridge-target-adapter: target-adapter,
+        bridge-contract: bridge-contract,
+        bridge-status: "active"
+      }
+    )
+    (ok bridge-contract)
+  )
+)
+
+;; Update bridge status
+(define-public (update-bridge-status 
+  (source-registry-chain-id uint) 
+  (target-registry-chain-id uint) 
+  (new-status (string-ascii 16))
+)
+  (let (
+    (bridge-info (unwrap! (map-get? bridge-registry { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id }) ERR-NOT-REGISTERED))
+  )
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    
+    (map-set bridge-registry
+      { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id }
+      (merge bridge-info { bridge-status: new-status })
+    )
+    (ok true)
+  )
+)
+
+;; Resource management functions
+
+;; Register a new resource (token, NFT, etc.)
+(define-public (register-resource 
+  (resource-chain-id uint) 
+  (resource-id (buff 32)) 
+  (resource-type (string-ascii 16))
+  (contract-address principal)
+  (resource-name (string-ascii 64))
+)
+  (begin
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? chain-registry { registry-chain-id: resource-chain-id })) ERR-INVALID-CHAIN)
+    (asserts! (is-none (map-get? resource-registry { resource-chain-id: resource-chain-id, resource-hash: resource-id })) ERR-ALREADY-REGISTERED)
+    
+    (map-set resource-registry
+      { resource-chain-id: resource-chain-id, resource-hash: resource-id }
+      {
+        resource-type: resource-type,
+        resource-contract: contract-address,
+        resource-name: resource-name,
+        resource-status: "active"
+      }
+    )
+    (ok resource-id)
+  )
+)
+
+;; Update resource status
+(define-public (update-resource-status 
+  (resource-chain-id uint) 
+  (resource-id (buff 32)) 
+  (new-status (string-ascii 16))
+)
+  (let (
+    (resource-info (unwrap! (map-get? resource-registry { resource-chain-id: resource-chain-id, resource-hash: resource-id }) ERR-NOT-REGISTERED))
+  )
+    (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+    
+    (map-set resource-registry
+      { resource-chain-id: resource-chain-id, resource-hash: resource-id }
+      (merge resource-info { resource-status: new-status })
+    )
+    (ok true)
   )
 )
 
 ;; Read-only functions
 
-;; Get message information
-(define-read-only (get-message (message-id (buff 32)))
-  (map-get? message-registry { message-id: message-id })
+;; Get chain information
+(define-read-only (get-chain-info (registry-chain-id uint))
+  (map-get? chain-registry { registry-chain-id: registry-chain-id })
 )
 
-;; Check if a message has been processed
-(define-read-only (is-message-processed (source-registry-chain-id uint) (nonce uint))
-  (match (map-get? processed-registry 
-    { processed-source-chain: source-registry-chain-id, processed-nonce: nonce })
-    processed-info true
+;; Get adapter information
+(define-read-only (get-adapter-info (adapter-id principal))
+  (map-get? adapter-registry { adapter-principal: adapter-id })
+)
+
+;; Get bridge information
+(define-read-only (get-bridge-info (source-registry-chain-id uint) (target-registry-chain-id uint))
+  (map-get? bridge-registry { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id })
+)
+
+;; Get resource information
+(define-read-only (get-resource-info (resource-chain-id uint) (resource-id (buff 32)))
+  (map-get? resource-registry { resource-chain-id: resource-chain-id, resource-hash: resource-id })
+)
+
+;; Check if a chain is active
+(define-read-only (is-chain-active (registry-chain-id uint))
+  (match (map-get? chain-registry { registry-chain-id: registry-chain-id })
+    chain-info (is-eq (get chain-status chain-info) "active")
     false
   )
 )
 
-;; Get current message fee
-(define-read-only (get-message-fee)
-  (var-get message-fee)
+;; Check if a bridge is active
+(define-read-only (is-bridge-active (source-registry-chain-id uint) (target-registry-chain-id uint))
+  (match (map-get? bridge-registry { bridge-source-chain: source-registry-chain-id, bridge-target-chain: target-registry-chain-id })
+    bridge-info (is-eq (get bridge-status bridge-info) "active")
+    false
+  )
 )
